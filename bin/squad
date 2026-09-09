@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# Naly Stack — coordination for parallel agent sessions, across models and providers.
+#
+# The problem: run two or more agent sessions on the same project and they clobber
+# each other — both grab the same task, both edit the same file, work gets lost.
+#
+# squad is the shared nervous system they coordinate through. It is deliberately tiny:
+# plain files, no daemon, no server, a git-diffable board.
+# `claim` atomically acquires task ownership with mkdir; it does not lock source files.
+# The board renders task files on demand. Lock and task updates are not transactional.
+# Handoffs and reviewer roles are a cooperative protocol, not enforced permissions.
+# Per-session inboxes carry assignments and handoff notifications.
+#
+# Storage (all under $SQUAD_DIR, default .squad/ at the git root):
+#   tasks/<id>          one file per task, key=value lines (the source of truth)
+#   locks/<id>/owner    atomic claim lock (mkdir) — the mutual-exclusion guarantee
+#   roster/<key>        friendly name per session; <key>.seen = inbox cursor
+#   events.log          append-only feed (ts, actor, verb, id, target, msg) — powers inbox
+#   config              squad settings (created by `squad init`)
+#
+# Coordinating sessions must share one filesystem (same machine, or the same repo
+# checkout) — the locks are local-FS atomic. See docs/CONCEPTS.md.
+
+set -uo pipefail
+
+# ── locate the squad dir ────────────────────────────────────────────────────────────
+# Explicit $SQUAD_DIR wins; else .squad/ at the git toplevel; else .squad/ in cwd.
+find_dir() {
+  if [ -n "${SQUAD_DIR:-}" ]; then echo "$SQUAD_DIR"; return; fi
+  local root; root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$root" ]; then echo "$root/.squad"; else echo "$PWD/.squad"; fi
+}
+DIR="$(find_dir)"
+TASKS="$DIR/tasks"; LOCKS="$DIR/locks"; ROSTER="$DIR/roster"; EVENTS="$DIR/events.log"
+
+now()  { date -u +%FT%TZ; }
+die()  { echo "squad: $*" >&2; exit 1; }
+have_dir() { [ -d "$DIR" ] || die "no squad here. Run 'squad init' first (looked in $DIR)."; }
+
+# ── identity ────────────────────────────────────────────────────────────────────────
+# A stable per-session key. Prefer an explicit $SQUAD_NAME (the launcher sets it), then
+# Claude's own session id (unique per running session, in the env of every tool call),
+# then tmux pane, then PID. The friendly name (roster/<key>) is what shows on the board.
+key() {
+  if   [ -n "${SQUAD_NAME:-}" ];              then echo "$SQUAD_NAME"
+  elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ];  then echo "cc-${CLAUDE_CODE_SESSION_ID%%-*}"
+  elif [ -n "${TMUX_PANE:-}" ];               then echo "tmux-${TMUX_PANE#%}"
+  else echo "sh-$$"; fi
+}
+me() {
+  [ -n "${SQUAD_NAME:-}" ] && { echo "$SQUAD_NAME"; return; }
+  local k; k="$(key)"; [ -f "$ROSTER/$k" ] && cat "$ROSTER/$k" || echo "$k"
+}
+
+# ── task files (key=value) ──────────────────────────────────────────────────────────
+tfile() { echo "$TASKS/$1"; }
+texists() { [ -f "$(tfile "$1")" ]; }
+# field <id> <key> → value (everything after the first '=')
+field() { local f; f="$(tfile "$1")"; [ -f "$f" ] || return 0; sed -n "s/^$2=//p" "$f" | head -1; }
+# setfield <id> <key> <value> — atomic rewrite (temp + mv). Safe: only the lock holder writes.
+setfield() {
+  local id="$1" k="$2" v="$3" f tmp; f="$(tfile "$id")"; tmp="$f.$$.tmp"
+  v="${v//$'\n'/ }"  # never let a newline break the line format
+  { if [ -f "$f" ] && grep -q "^$k=" "$f"; then SQUAD_FIELD_VALUE="$v" awk -v key="$k" 'index($0, key "=") == 1 { print key "=" ENVIRON["SQUAD_FIELD_VALUE"]; next } { print }' "$f"; else cat "$f" 2>/dev/null; echo "$k=$v"; fi; } > "$tmp"
+  mv "$tmp" "$f"
+  setfield_touch "$id"
+}
+setfield_touch() { local f tmp; f="$(tfile "$1")"; tmp="$f.$$.tmp"; grep -v "^updated=" "$f" > "$tmp"; echo "updated=$(now)" >> "$tmp"; mv "$tmp" "$f"; }
+
+# ── event feed + inbox ──────────────────────────────────────────────────────────────
+# Append is atomic for a short line on a local FS, so concurrent emits don't interleave.
+emit() { # emit <verb> <id> <target> <msg>
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$(me)" "$1" "$2" "${3:-*}" "${4:-}" >> "$EVENTS"
+}
+cursor_file() { echo "$ROSTER/$(key).seen"; }
+inbox() { # events since my cursor addressed to me or broadcast (*), then advance cursor
+  have_dir; [ -f "$EVENTS" ] || { echo "(inbox empty)"; return; }
+  local total seen; total="$(wc -l < "$EVENTS" | tr -d ' ')"
+  seen="$(cat "$(cursor_file)" 2>/dev/null || echo 0)"
+  local my; my="$(me)"
+  local shown=0
+  if [ "$total" -gt "$seen" ]; then
+    while IFS=$'\t' read -r ts actor verb id target msg; do
+      [ "$actor" = "$my" ] && continue                      # don't notify me of my own actions
+      if [ "$target" = "$my" ] || [ "$target" = "*" ]; then
+        printf '  %s  %-16s %-8s %s\n' "${ts:11:8}" "${actor} -> ${target}" "${verb}" "${id}${msg:+  ·  ${msg}}"
+        shown=$((shown+1))
+      fi
+    done < <(tail -n +"$((seen+1))" "$EVENTS")
+  fi
+  echo "$total" > "$(cursor_file)"
+  if [ "$shown" = 0 ]; then echo "  (nothing new for $my)"; fi
+}
+
+# ── id allocation (race-safe via the same mkdir lock) ───────────────────────────────
+next_id() {
+  local lock="$DIR/.idlock" c=0
+  while ! mkdir "$lock" 2>/dev/null; do c=$((c+1)); [ "$c" -gt 200 ] && die "id lock stuck"; done
+  local n; n="$(cat "$DIR/.idseq" 2>/dev/null || echo 0)"; n=$((n+1)); echo "$n" > "$DIR/.idseq"
+  rmdir "$lock"; echo "t$n"
+}
+
+# ── the atomic claim (the whole point) ──────────────────────────────────────────────
+lock_claim() { # returns 0 and writes owner if we win the race; 1 if already held
+  local id="$1"
+  if mkdir "$LOCKS/$id" 2>/dev/null; then printf '%s\t%s\n' "$(me)" "$(now)" > "$LOCKS/$id/owner"; return 0; fi
+  return 1
+}
+lock_owner() { cut -f1 "$LOCKS/$1/owner" 2>/dev/null; }
+lock_free()  { rm -rf "$LOCKS/$1"; }
+
+# Learning is additive: missing Python/helper or a failed snapshot must not strand a claim.
+learn_event() {
+  if command -v python3 >/dev/null && command -v squad-learn >/dev/null; then
+    SQUAD_DIR="$DIR" SQUAD_NAME="$(me)" squad-learn "$@" >/dev/null ||
+      echo "squad: learning record failed; board action succeeded. Inspect with squad outcome <id>." >&2
+  else
+    echo "squad: learning skipped (needs Python 3 and squad-learn; rerun install.sh)." >&2
+  fi
+  return 0
+}
+
+# ── commands ────────────────────────────────────────────────────────────────────────
+cmd="${1:-board}"; shift || true
+case "$cmd" in
+
+init)
+  mkdir -p "$TASKS" "$LOCKS" "$ROSTER" "$DIR/skills"; touch "$EVENTS"
+  if [ ! -f "$DIR/config" ]; then
+    { echo "# squad config"; echo "project=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")")"; echo "created=$(now)"; } > "$DIR/config"
+  fi
+  echo "Naly Stack ready at $DIR"
+  echo "next: 'squad name <you>', then 'squad add \"first task\"'." ;;
+
+name)
+  have_dir; [ -z "${1:-}" ] && die "usage: squad name <friendly>"
+  echo "$1" > "$ROSTER/$(key)"; echo "session $(key) is now: $1" ;;
+
+whoami) echo "$(me)  (key: $(key))" ;;
+
+add)
+  have_dir; [ -z "${1:-}" ] && die "usage: squad add \"<title>\" [--notes \"...\"]"
+  title="${1//$'\n'/ }"; shift; notes=""; role=""; skills=""; assigned=""
+  while [ $# -gt 0 ]; do
+    [ $# -ge 2 ] || die "missing value for $1"
+    case "$1" in
+      --notes) notes="${2//$'\n'/ }";;
+      --role) role="$2";;
+      --skills) skills="$2";;
+      *) die "unknown add option: $1";;
+    esac
+    shift 2
+  done
+  [[ "$role" != *$'\n'* && "$skills" != *$'\n'* ]] || die "role and skills must be single-line values"
+  if [ -n "$role" ]; then
+    assigned="$(SQUAD_DIR="$DIR" squad-up --select-role "$role")" || exit 1
+  fi
+  id="$(next_id)"
+  { echo "id=$id"; echo "title=$title"; echo "status=backlog"; echo "owner="; echo "reviewer=";
+    echo "branch="; echo "role=$role"; echo "assigned=$assigned"; echo "skills=$skills"; echo "notes=$notes"; echo "created=$(now)"; echo "updated=$(now)"; } > "$(tfile "$id")"
+  emit add "$id" "${assigned:--}" "$title"
+  echo "added $id  ·  $title" ;;
+
+claim)
+  have_dir; id="${1:-}"; [ -z "$id" ] && die "usage: squad claim <id>"
+  texists "$id" || [[ "$id" == rev:* ]] || die "no such task: $id"
+  assigned="$(field "$id" assigned)"
+  [ -z "$assigned" ] || [ "$assigned" = "$(me)" ] || die "$id is assigned to $assigned"
+  if lock_claim "$id"; then
+    if texists "$id"; then setfield "$id" owner "$(me)"; setfield "$id" status doing; setfield "$id" attempt_token "$(now)-$$-$RANDOM"; fi
+    emit claim "$id" "-" ""
+    if texists "$id"; then learn_event capture "$id"; fi
+    echo "CLAIMED $id  →  $(me)"
+  else
+    echo "DENIED $id — already owned by $(lock_owner "$id")"; exit 1
+  fi ;;
+
+handoff)
+  have_dir; id="${1:-}"; shift || true
+  [ -z "$id" ] && die "usage: squad handoff <id> --to <who> [--review] [--notes \"...\"]"
+  texists "$id" || die "no such task: $id"
+  to=""; review=0; notes=""; branch=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --to) to="${2:-}"; shift 2;; --review) review=1; shift;; --notes) notes="${2:-}"; shift 2;; --branch) branch="${2:-}"; shift 2;; *) shift;; esac; done
+  [ -z "$to" ] && die "handoff needs --to <who>"
+  [ -n "$notes" ] && setfield "$id" notes "$notes"
+  [ -n "$branch" ] && setfield "$id" branch "$branch"
+  if [ "$review" = 1 ]; then setfield "$id" status review; setfield "$id" reviewer "$to";
+  else setfield "$id" status blocked; setfield "$id" owner "$to"; setfield "$id" assigned "$to"; fi
+  lock_free "$id"                       # release so the recipient can claim it
+  emit handoff "$id" "$to" "$([ "$review" = 1 ] && echo 'for review' || echo 'handed to you')${notes:+: $notes}"
+  echo "handed $id → $to$([ "$review" = 1 ] && echo ' (review)')" ;;
+
+pass)
+  have_dir; id="${1:-}"; [ -z "$id" ] && die "usage: squad pass <id>"
+  texists "$id" || die "no such task: $id"
+  owner="$(field "$id" owner)"
+  setfield "$id" status done; setfield "$id" verdict pass; lock_free "$id"; lock_free "rev:$id"
+  emit pass "$id" "${owner:-*}" "review passed"
+  learn_event status "$id" pass
+  echo "PASS $id — done" ;;
+
+fail)
+  have_dir; id="${1:-}"; reason="${2:-}"
+  [ -z "$id" ] && die "usage: squad fail <id> \"<reason>\""
+  texists "$id" || die "no such task: $id"
+  owner="$(field "$id" owner)"
+  setfield "$id" status doing; setfield "$id" verdict "fail: $reason"; lock_free "rev:$id"
+  emit fail "$id" "${owner:-*}" "${reason:-needs work}"
+  learn_event status "$id" fail "$reason"
+  echo "FAIL $id → back to ${owner:-owner}: $reason" ;;
+
+done|finish)
+  have_dir; id="${1:-}"; [ -z "$id" ] && die "usage: squad done <id>"
+  texists "$id" && setfield "$id" status done
+  lock_free "$id"; emit done "$id" "-" ""
+  if texists "$id"; then learn_event status "$id" done; fi
+  echo "DONE $id" ;;
+
+release|drop)
+  have_dir; id="${1:-}"; [ -z "$id" ] && die "usage: squad release <id>"
+  if texists "$id"; then setfield "$id" status backlog; setfield "$id" owner ""; fi
+  lock_free "$id"; emit release "$id" "-" ""
+  echo "RELEASED $id → backlog" ;;
+
+log|note)
+  have_dir; [ -z "${1:-}" ] && die "usage: squad log \"<message>\""
+  emit note "-" "*" "$1"; echo "logged." ;;
+
+inbox) inbox ;;
+
+outcome)
+  have_dir
+  if [ "${1:-}" = capture ]; then shift; exec env SQUAD_DIR="$DIR" SQUAD_NAME="$(me)" squad-learn capture "$@"; fi
+  exec env SQUAD_DIR="$DIR" SQUAD_NAME="$(me)" squad-learn outcome "$@" ;;
+
+insights|proposal|check)
+  have_dir
+  exec env SQUAD_DIR="$DIR" SQUAD_NAME="$(me)" squad-learn "$cmd" "$@" ;;
+
+skills)
+  have_dir
+  [ "${1:-}" = sync ] || die "usage: squad skills sync [sessions-file]"
+  shift
+  exec env SQUAD_DIR="$DIR" squad-up --sync-skills "$@" ;;
+
+up)
+  command -v squad-up >/dev/null || die "launcher 'squad-up' not on PATH (install.sh symlinks it; or run launcher/squad-up directly)."
+  exec env SQUAD_DIR="$DIR" squad-up "$@" ;;
+
+set)
+  have_dir; id="${1:-}"; k="${2:-}"; v="${3:-}"
+  { [ -z "$id" ] || [ -z "$k" ]; } && die "usage: squad set <id> <key> <value>"
+  texists "$id" || die "no such task: $id"; setfield "$id" "$k" "$v"; echo "set $id $k=$v" ;;
+
+show)
+  have_dir; id="${1:-}"; texists "$id" || die "no such task: $id"; cat "$(tfile "$id")" ;;
+
+list)
+  have_dir; want=""; mineonly=0
+  while [ $# -gt 0 ]; do case "$1" in --status) want="${2:-}"; shift 2;; --mine) mineonly=1; shift;; *) shift;; esac; done
+  my="$(me)"; found=0
+  for f in "$TASKS"/*; do
+    [ -f "$f" ] || continue; id="$(basename "$f")"
+    st="$(field "$id" status)"; ow="$(field "$id" owner)"
+    [ -n "$want" ] && [ "$st" != "$want" ] && continue
+    [ "$mineonly" = 1 ] && [ "$ow" != "$my" ] && continue
+    printf '  %-5s %-8s %-12s %s\n' "$id" "$st" "${ow:--}" "$(field "$id" title)"; found=1
+  done
+  if [ "$found" = 0 ]; then echo "  (no tasks)"; fi ;;
+
+status)
+  have_dir; echo "active claims:"
+  local_found=0
+  for d in "$LOCKS"/*/; do [ -d "$d" ] || continue; local_found=1; printf '  %-14s %s\n' "$(basename "$d")" "$(cat "$d/owner" 2>/dev/null)"; done
+  [ "$local_found" = 0 ] && echo "  (none)"
+  echo; echo "your inbox:"; inbox ;;
+
+roster)
+  have_dir; found=0
+  for f in "$ROSTER"/*; do [ -f "$f" ] || continue; case "$f" in *.seen) continue;; esac; printf '  %-10s (%s)\n' "$(cat "$f")" "$(basename "$f")"; found=1; done
+  if [ "$found" = 0 ]; then echo "  (no one registered — run 'squad name <you>')"; fi ;;
+
+board)
+  have_dir
+  proj="$(sed -n 's/^project=//p' "$DIR/config" 2>/dev/null)"
+  echo "# Naly Stack board${proj:+ · $proj}"
+  echo
+  echo "## Roster"
+  r=0; for f in "$ROSTER"/*; do [ -f "$f" ] || continue; case "$f" in *.seen) continue;; esac; echo "- **$(cat "$f")** ($(basename "$f"))"; r=1; done
+  [ "$r" = 0 ] && echo "- (no one registered yet)"
+  echo
+  for st in backlog doing review blocked done; do
+    rows=""
+    for f in "$TASKS"/*; do
+      [ -f "$f" ] || continue; id="$(basename "$f")"; [ "$(field "$id" status)" = "$st" ] || continue
+      ow="$(field "$id" owner)"; rv="$(field "$id" reviewer)"; br="$(field "$id" branch)"; nt="$(field "$id" notes)"; vd="$(field "$id" verdict)"
+      extra="${ow:-$(field "$id" assigned)}"; [ -n "$rv" ] && extra="$extra → $rv"; [ -n "$br" ] && extra="$extra @$br"; [ -n "$vd" ] && extra="$extra ($vd)"
+      rows="$rows| $id | $(field "$id" title) | ${extra:--} | ${nt:-} |"$'\n'
+    done
+    [ -z "$rows" ] && continue
+    printf '## %s\n\n' "$(echo "$st" | tr '[:lower:]' '[:upper:]')"
+    echo "| id | task | who | notes |"; echo "|---|---|---|---|"; printf '%s\n' "$rows"
+  done
+  if [ -f "$EVENTS" ] && [ -s "$EVENTS" ]; then
+    echo "## Recent"
+    tail -8 "$EVENTS" | while IFS=$'\t' read -r ts actor verb id target msg; do
+      echo "- \`${ts:11:8}\` **$actor** $verb $id${msg:+ — $msg}"
+    done
+  fi ;;
+
+help|-h|--help)
+  cat <<'EOF'
+Naly Stack — coordination and shared learning for coding agents
+
+setup
+  naly init                    create .squad/ here (git root)
+  naly name <you>              register this session's friendly name
+  naly up [file] [--dry-run] [--no-yolo]   launch mixed agents (YOLO by default)
+  naly skills sync [file]      link shared skills into each session worktree
+
+work loop
+  naly board                   the rendered board (roster · tasks · recent)
+  naly inbox                   what's happened FOR YOU since you last looked
+  naly add "<title>" [--role frontend] [--skills name,name] [--notes "..."]
+  naly claim <id>              atomically take it (proceed only on CLAIMED)
+  naly handoff <id> --to <who> [--review] [--notes ".."]   pass it on
+  naly pass <id> | fail <id> "<why>"   reviewer verdict
+  naly done <id>               finish (clears the lock)
+  naly release <id>            give it back to the backlog
+
+learning (local evidence; no model API calls)
+  naly outcome <id>            inspect attempt snapshots, checks, and feedback
+  naly outcome <id> --decision accepted|revised|rejected [--source human|agent]
+    [--reason "..."] [--correction tag --skill name --kind preference|defect --lesson "..."]
+  naly check <id> -- <command>  run a check and record its actual exit code
+  naly insights [--json] [--propose]   find recurring corrections; draft skill changes
+  naly proposal show|apply <id>       review/apply a proposed skill change
+
+inspect
+  naly list [--status s] [--mine] · show <id> · status · roster · log "<note>"
+
+The board renders .squad/tasks/. `claim` atomically acquires task ownership.
+Claims do not lock source files; review gates depend on the team's protocol.
+EOF
+  ;;
+
+*) die "unknown command '$cmd' — try 'naly help'" ;;
+esac

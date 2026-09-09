@@ -1,0 +1,6 @@
+.DS_Store
+# If you run `squad init` inside this repo while hacking, don't commit the runtime state:
+/.squad/
+*.tmp
+
+__pycache__/

@@ -1,0 +1,16 @@
+{
+  "name": "squad",
+  "version": "0.1.0",
+  "description": "Naly Stack coordination: mixed coding agents, shared task ownership, cross-model handoffs, and reviewed skill improvements.",
+  "author": {
+    "name": "Naly Stack contributors"
+  },
+  "homepage": "https://github.com/defi-naly/naly-stack",
+  "keywords": [
+    "multi-agent",
+    "coordination",
+    "parallel",
+    "worktree",
+    "orchestration"
+  ]
+}

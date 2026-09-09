@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Local task evidence and reviewable skill improvements. No model API calls."""
+import argparse
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+import difflib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def slug(value):
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}', value):
+        raise ValueError(f'invalid identifier: {value!r}')
+    return value
+
+
+def atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.tmp-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.exists():
+            os.chmod(temporary, path.stat().st_mode & 0o777)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def write_json(path, value):
+    atomic(path, (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode())
+
+
+class Learning:
+    def __init__(self):
+        self.board = Path(os.environ['SQUAD_DIR']).expanduser().resolve()
+        if not (self.board / 'tasks').is_dir():
+            raise ValueError('run squad init first')
+        self.root = self.board / 'learning'
+
+    def task(self, task_id):
+        slug(task_id)
+        path = self.board / 'tasks' / task_id
+        if not path.is_file():
+            raise ValueError(f'no such task: {task_id}')
+        return dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
+
+    def events(self):
+        result = []
+        for path in sorted((self.root / 'events').glob('*.json')):
+            event = json.loads(path.read_text())
+            if event.get('schema') != 1:
+                raise ValueError(f'unsupported learning event schema: {path}')
+            result.append(event)
+        return sorted(result, key=lambda e: (e['at'], e['id']))
+
+    def emit(self, event_type, **fields):
+        event = dict(schema=1, id=uuid.uuid4().hex, at=datetime.now(timezone.utc).isoformat(),
+                     type=event_type, actor=os.environ.get('SQUAD_NAME', 'unidentified'), **fields)
+        write_json(self.root / 'events' / (event['id'] + '.json'), event)
+        return event
+
+    def capture(self, task_id):
+        task = self.task(task_id)
+        agent = os.environ.get('SQUAD_AGENT_KIND', '')
+        model = os.environ.get('SQUAD_MODEL', '')
+        # Manual sessions may use the configured roster; record that provenance.
+        provenance = 'launch-environment' if agent else 'unknown'
+        if not agent:
+            path = Path(os.environ.get('SQUAD_SESSIONS', str(self.board / 'sessions')))
+            if path.is_file():
+                for line in path.read_text().splitlines():
+                    parts = line.split('\t')
+                    if parts[0] == task.get('owner') and len(parts) >= 4:
+                        command = shlex.split(parts[3] or os.environ.get('SQUAD_AGENT', 'claude'))
+                        agent = Path(command[0]).name if command else ''
+                        model = parts[4] if len(parts) > 4 else ''
+                        provenance = 'sessions-config'
+                        break
+        skills = []
+        for name in filter(None, (s.strip() for s in task.get('skills', '').split(','))):
+            slug(name)
+            path = self.board / 'skills' / name / 'SKILL.md'
+            skills.append(dict(name=name, sha256=digest(path.read_bytes()) if path.is_file() else None))
+        return self.emit('attempt', task=task_id, generation=task.get('attempt_token', ''), title=task.get('title', ''),
+                         owner=task.get('owner', ''), role=task.get('role', ''),
+                         agent=agent or 'unknown', model=model or 'unknown (CLI default)',
+                         model_provenance=provenance, skills=skills)
+
+    def attempt(self, task_id, attempt_id=None):
+        task = self.task(task_id)
+        attempts = [e for e in self.events() if e['type'] == 'attempt' and e['task'] == task_id]
+        if attempt_id:
+            attempts = [e for e in attempts if e['id'] == attempt_id]
+        elif task.get('attempt_token'):
+            attempts = [e for e in attempts if e.get('generation') == task['attempt_token']]
+        if not attempts:
+            raise ValueError('no captured attempt; claim the task first (or squad outcome capture <id> for legacy work)')
+        return attempts[-1]
+
+    def status(self, task_id, verdict, reason):
+        try:
+            attempt = self.attempt(task_id)
+        except ValueError:
+            # Do not fabricate historical model/skill attribution for legacy tasks.
+            print(f'squad learning: {task_id} has no attempt snapshot; verdict not attributed', file=sys.stderr)
+            return
+        decision = {'pass': 'accepted', 'fail': 'revised', 'done': 'unassessed'}[verdict]
+        self.emit('outcome', task=task_id, attempt=attempt['id'], decision=decision,
+                  source='workflow', reason=reason, correction=None, skill=None, kind=None, lesson=None)
+
+    def outcome(self, args):
+        if not args.decision:
+            self.task(args.task)
+            if any((args.reason, args.correction, args.skill, args.kind, args.lesson, args.changes)):
+                raise ValueError('feedback requires --decision')
+            print(json.dumps([e for e in self.events() if e.get('task') == args.task], indent=2))
+            return
+        attempt = self.attempt(args.task, args.attempt)
+        if args.decision in ('revised', 'rejected') and not args.reason:
+            raise ValueError('revised/rejected outcomes need --reason')
+        if args.correction:
+            slug(args.correction)
+            if not all((args.skill, args.kind, args.reason)):
+                raise ValueError('--correction needs --skill, --kind, and --reason')
+            if args.skill not in [s['name'] for s in attempt['skills']]:
+                raise ValueError('correction skill must be listed in the captured task attempt')
+        elif any((args.skill, args.kind, args.lesson)):
+            raise ValueError('--skill, --kind, and --lesson require --correction')
+        if args.lesson and ('\n' in args.lesson or not args.lesson.strip()):
+            raise ValueError('--lesson must be one nonempty line of proposed instruction')
+        event = self.emit('outcome', task=args.task, attempt=attempt['id'], decision=args.decision,
+                          source=args.source, reason=args.reason or '', correction=args.correction,
+                          skill=args.skill, kind=args.kind, lesson=args.lesson, changes=args.changes or '',
+                          branch=self.task(args.task).get('branch', ''))
+        print(f"Recorded {args.decision} for {args.task} (attempt {attempt['id']}, evidence {event['id']})")
+
+    def check(self, args):
+        attempt = self.attempt(args.task, args.attempt)
+        command = args.command
+        if command and command[0] == '--':
+            command = command[1:]
+        if not command:
+            raise ValueError('usage: squad check <task> -- <command> [args...]')
+        started = datetime.now(timezone.utc)
+        result = subprocess.run(command)
+        self.emit('check', task=args.task, attempt=attempt['id'], command=command,
+                  cwd=str(Path.cwd()), exit_code=result.returncode,
+                  elapsed_seconds=(datetime.now(timezone.utc) - started).total_seconds())
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+    def insights(self):
+        events = self.events()
+        attempts = {e['id']: e for e in events if e['type'] == 'attempt'}
+        latest_attempts = {a['task']: a for a in attempts.values()}
+        outcomes = defaultdict(list)
+        patterns = defaultdict(dict)
+        for event in events:
+            if event['type'] != 'outcome' or event['attempt'] not in attempts:
+                continue
+            outcomes[event['attempt']].append(event)
+            if event.get('correction'):
+                key = (event['skill'], event['correction'], event['kind'], event['source'])
+                # A task contributes at most once per pattern, including across rework attempts.
+                patterns[key][event['task']] = event
+        summaries = defaultdict(Counter)
+        missing_current = []
+        for attempt in latest_attempts.values():
+            current = self.task(attempt['task'])
+            if current.get('attempt_token') and current['attempt_token'] != attempt.get('generation'):
+                missing_current.append(attempt['task'])
+                summaries[(current.get('role', ''), 'unknown', 'uncaptured attempt', 'none')]['unassessed'] += 1
+                continue
+            reports = outcomes[attempt['id']]
+            human = [e for e in reports if e['source'] == 'human']
+            report = (human or reports)[-1] if reports else None
+            key = (attempt['role'], attempt['agent'], attempt['model'],
+                   report['source'] if report else 'none')
+            summaries[key][report['decision'] if report else 'unassessed'] += 1
+        signals = []
+        for (skill, correction, kind, source), records in sorted(patterns.items()):
+            evidence = sorted(records.values(), key=lambda e: e['task'])
+            if len(evidence) >= 3:
+                signals.append(dict(skill=skill, correction=correction, kind=kind, source=source,
+                                    task_count=len(evidence), evidence=evidence))
+        return dict(task_count=len(latest_attempts), attempt_count=len(attempts),
+                    missing_current_attempts=missing_current,
+                    summaries=[dict(role=k[0], agent=k[1], model=k[2], source=k[3], counts=dict(v))
+                               for k, v in sorted(summaries.items())],
+                    patterns=signals,
+                    checks=[e for e in events if e['type'] == 'check'],
+                    note='Descriptive project history, not a model ranking or causal comparison. '
+                         'Model names are configured labels; CLI defaults are unknown. '
+                         'Sources are self-declared; a check exit code is not proof of task correctness.')
+
+    def propose(self, pattern):
+        lessons = Counter(e['lesson'] for e in pattern['evidence'] if e.get('lesson'))
+        if not lessons:
+            return None
+        top_count = max(lessons.values())
+        candidates = [lesson for lesson, count in lessons.items() if count == top_count]
+        if len(candidates) != 1:
+            return None  # Conflicting equally-supported lessons require a human decision.
+        lesson = candidates[0]
+        if top_count < 3:
+            return None
+        path = self.board / 'skills' / slug(pattern['skill']) / 'SKILL.md'
+        if not path.is_file():
+            return None
+        before = path.read_bytes().decode('utf-8')
+        if lesson in before:
+            return None
+        addition = '\n\n## Lesson from reviewed tasks\n\n- ' + lesson + '\n'
+        after = before.rstrip() + addition
+        evidence = [e for e in pattern['evidence'] if e.get('lesson') == lesson]
+        proposal_id = digest(json.dumps([pattern['skill'], digest(before.encode()), lesson,
+                                        [e['id'] for e in evidence]]).encode())[:20]
+        proposal = dict(id=proposal_id, skill=pattern['skill'], kind=pattern['kind'],
+                        source=pattern['source'], base_sha256=digest(before.encode()),
+                        lesson=lesson, after=after, evidence=evidence)
+        folder = self.root / 'proposals'
+        path_json = folder / (proposal_id + '.json')
+        if not path_json.exists():
+            write_json(path_json, proposal)
+        patch = ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                           fromfile=f"a/{pattern['skill']}/SKILL.md",
+                                           tofile=f"b/{pattern['skill']}/SKILL.md"))
+        review = (f"# Proposed skill change: {pattern['skill']}\n\n"
+                  f"ID: {proposal_id}\nSource: {pattern['source']} / {pattern['kind']}\n\n"
+                  + '\n'.join(f"- {e['task']} (attempt {e['attempt']}, evidence {e['id']}): {e['reason']}"
+                              for e in evidence)
+                  + '\n\n```diff\n' + patch + '```\n\n'
+                  + f'After reviewing, apply with `naly proposal apply {proposal_id}`.\n'
+                  + 'The saved JSON is authoritative; use `naly proposal show <id>` before applying.\n')
+        atomic(folder / (proposal_id + '.md'), review.encode())
+        return proposal_id
+
+    def proposal(self, action, proposal_id):
+        slug(proposal_id)
+        path = self.root / 'proposals' / (proposal_id + '.json')
+        proposal = json.loads(path.read_text())
+        if action == 'show':
+            print(json.dumps(proposal, indent=2, ensure_ascii=False))
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / '.apply-lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            source = (self.board / 'skills' / slug(proposal['skill']) / 'SKILL.md').resolve()
+            before = source.read_bytes()
+            if digest(before) != proposal['base_sha256']:
+                raise ValueError('skill changed since proposal creation; regenerate and review a fresh proposal')
+            after = proposal['after'].encode()
+            atomic(source, after)
+            self.emit('skill-update', proposal=proposal_id, skill=proposal['skill'],
+                      before_sha256=digest(before), after_sha256=digest(after))
+        print(f"Applied {proposal_id} to shared skill {proposal['skill']}; reload skills in active agents")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='action', required=True)
+    capture = commands.add_parser('capture')
+    capture.add_argument('task')
+    status = commands.add_parser('status')
+    status.add_argument('task')
+    status.add_argument('verdict', choices=['pass', 'fail', 'done'])
+    status.add_argument('reason', nargs='?', default='')
+    outcome = commands.add_parser('outcome')
+    outcome.add_argument('task')
+    outcome.add_argument('--attempt')
+    outcome.add_argument('--decision', choices=['accepted', 'revised', 'rejected'])
+    outcome.add_argument('--source', choices=['human', 'agent'], default='agent')
+    outcome.add_argument('--reason')
+    outcome.add_argument('--changes', help='reviewer changes or human intervention summary')
+    outcome.add_argument('--correction')
+    outcome.add_argument('--skill')
+    outcome.add_argument('--kind', choices=['preference', 'defect'])
+    outcome.add_argument('--lesson')
+    check = commands.add_parser('check')
+    check.add_argument('task')
+    check.add_argument('command', nargs=argparse.REMAINDER)
+    check.set_defaults(attempt=None)
+    insights = commands.add_parser('insights')
+    insights.add_argument('--json', action='store_true')
+    insights.add_argument('--propose', action='store_true')
+    proposal = commands.add_parser('proposal')
+    proposal.add_argument('operation', choices=['show', 'apply'])
+    proposal.add_argument('id')
+    args = parser.parse_args()
+    learning = Learning()
+    if args.action == 'capture':
+        print(learning.capture(args.task)['id'])
+    elif args.action == 'status':
+        learning.status(args.task, args.verdict, args.reason)
+    elif args.action == 'outcome':
+        learning.outcome(args)
+    elif args.action == 'check':
+        return learning.check(args)
+    elif args.action == 'proposal':
+        learning.proposal(args.operation, args.id)
+    else:
+        report = learning.insights()
+        if args.propose:
+            report['proposals'] = list(filter(None, (learning.propose(p) for p in report['patterns'])))
+        if args.json:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(f"Naly Stack insights: {report['task_count']} tasks, {report['attempt_count']} attempts")
+            print(report['note'])
+            if report['missing_current_attempts']:
+                print('Missing current attempt snapshots: ' + ', '.join(report['missing_current_attempts']))
+            for row in report['summaries']:
+                print(f"  {row['role'] or 'general'} / {row['agent']} / {row['model']} "
+                      f"[{row['source']}]: {row['counts']}")
+            print(f"Executed checks recorded: {len(report['checks'])}")
+            if not report['patterns']:
+                print('No repeated correction across three distinct tasks yet.')
+            for pattern in report['patterns']:
+                print(f"\n{pattern['skill']}: {pattern['correction']} "
+                      f"[{pattern['kind']}, {pattern['source']}] — {pattern['task_count']} tasks")
+                for event in pattern['evidence']:
+                    print(f"  {event['task']} [{event['id']}]: {event['reason']}")
+            for proposal_id in report.get('proposals', []):
+                print(f'Proposal ready: naly proposal show {proposal_id}')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, KeyError) as error:
+        print(f'squad learning: {error}', file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,10 @@
+# TAB-separated: name, working-dir, prompt, agent command, model, role
+# The agent, model, and role columns are optional.
+# Blank agent uses SQUAD_AGENT (otherwise claude). Blank model uses the CLI default.
+# Give each session its own existing worktree. Roles must resolve to one session.
+# Claude and Codex launch in YOLO mode by default (naly up --no-yolo opts out).
+# Custom wrappers receive SQUAD_YOLO=1 and must apply their own permission flags.
+# Copy to .squad/sessions, edit paths, then: naly up --dry-run
+frontend	~/dev/proj-frontend	Handle frontend design and UI implementation.	claude		frontend
+builder	~/dev/proj-builder	Handle other implementation work.	codex		default
+reviewer	~/dev/proj-review	Review handed-off changes and run project checks.	codex		review

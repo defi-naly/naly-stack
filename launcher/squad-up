@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Launch peer agent CLIs with a shared board, role routing, and skill sources."""
+import argparse
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def board_dir():
+    if os.environ.get('SQUAD_DIR'):
+        return Path(os.environ['SQUAD_DIR']).expanduser().resolve()
+    result = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+    return Path(result.stdout.strip() if result.returncode == 0 else os.getcwd()) / '.squad'
+
+
+def sessions(path):
+    result = []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        parts = line.split('\t')
+        if len(parts) > 6:
+            raise ValueError(f'{path}:{number}: expected name, directory, prompt, agent, model, role (tabs)')
+        name, directory, prompt, agent, model, role = parts + [''] * (6 - len(parts))
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', name):
+            raise ValueError(f'{path}:{number}: invalid session name {name!r}')
+        if any(s['name'] == name for s in result):
+            raise ValueError(f'duplicate session name: {name}')
+        # Preserve the original format: relative directories are relative to the caller.
+        directory = Path(directory or os.getcwd()).expanduser().resolve()
+        command = shlex.split(agent or os.environ.get('SQUAD_AGENT', 'claude'))
+        if not command:
+            raise ValueError(f'{name}: empty agent command')
+        if model:
+            command += ['--model', model]
+        else:
+            for index, argument in enumerate(command):
+                if argument in ('--model', '-m') and index + 1 < len(command):
+                    model = command[index + 1]
+                elif argument.startswith('--model='):
+                    model = argument.split('=', 1)[1]
+        result.append(dict(name=name, directory=directory, prompt=prompt,
+                           command=command, model=model, role=role, sessions_file=path.resolve()))
+    if not result:
+        raise ValueError(f'no sessions defined in {path}')
+    return result
+
+
+def skill_links(board, members):
+    """Plan all links first; never replace an existing skill or broken symlink."""
+    library = board / 'skills'
+    sources = {'squad': ROOT / 'plugin/skills/squad'}
+    if library.is_dir():
+        for source in sorted(library.iterdir()):
+            if (source / 'SKILL.md').is_file():
+                if source.name in sources or source.name.lower() == 'synced':
+                    raise ValueError(f'reserved shared skill name: {source.name}')
+                sources[source.name] = source.resolve()
+    links = {}
+    for member in members:
+        for folder in ('.agents/skills', '.claude/skills'):
+            for name, source in sources.items():
+                target = member['directory'] / folder / name
+                if target.is_symlink() and target.resolve() == source.resolve():
+                    continue
+                if target.exists() or target.is_symlink():
+                    raise ValueError(f'skill conflict: {target}; preserve or move it before syncing')
+                links[target] = source
+    return links
+
+
+def sync_skills(links):
+    for target, source in links.items():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source, target_is_directory=True)
+
+
+def launch_command(member, board, yolo=True):
+    protocol = ROOT / 'plugin/skills/squad/SKILL.md'
+    prompt = (f"Naly Stack onboarding: you are {member['name']}, role {member['role'] or 'general'}. "
+              f"Use the shared board at {board}. Read {protocol}, run squad board and squad inbox. "
+              "Tasks with assigned=another session belong to that peer. For frontend/design work, "
+              "use squad add with --role frontend; use --role default for other implementation work "
+              "when these roles exist in the sessions file. Read a task's listed skills before working. "
+              "Claim a suitable task before editing. If none is available, wait for instructions. ")
+    prompt += member['prompt']
+    env = ['env', f"SQUAD_AGENT_KIND={Path(member['command'][0]).name}",
+           f"SQUAD_MODEL={member['model']}", f'SQUAD_YOLO={int(yolo)}', f"SQUAD_NAME={member['name']}", f'SQUAD_DIR={board}',
+           f"SQUAD_SESSIONS={member['sessions_file']}", f"SQUAD_ROLE={member['role']}", f'SQUAD_SKILLS_DIR={board / "skills"}',
+           f'PATH={ROOT / "bin"}:{ROOT / "launcher"}:{os.environ.get("PATH", "")}']
+    command = list(member['command'])
+    agent = Path(command[0]).name
+    bypass_flags = {'codex': '--dangerously-bypass-approvals-and-sandbox',
+                    'claude': '--dangerously-skip-permissions'}
+    if yolo and agent in bypass_flags and bypass_flags[agent] not in command:
+        command.append(bypass_flags[agent])
+    if agent in bypass_flags:
+        command += ['--add-dir', str(board), '--']
+    return shlex.join(env + command + [prompt])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('sessions_file', nargs='?')
+    parser.add_argument('--no-yolo', action='store_true', help='use CLI permission defaults instead of automatic approval bypass')
+    parser.add_argument('--dry-run', action='store_true', help='print commands without modifying or launching anything')
+    parser.add_argument('--sync-skills', action='store_true', help='link shared skills into all session worktrees, then exit')
+    parser.add_argument('--select-role', help='print the unique session for this role (falls back to default)')
+    args = parser.parse_args()
+    board = board_dir()
+    path = Path(args.sessions_file or os.environ.get('SQUAD_SESSIONS', str(board / 'sessions'))).expanduser()
+    session_name = os.environ.get('SQUAD_SESSION', 'squad')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', session_name):
+        raise ValueError('SQUAD_SESSION must contain only letters, digits, underscores and hyphens')
+    # Attaching to an existing squad does not require its old config or executables.
+    if not (args.dry_run or args.sync_skills or args.select_role):
+        if not shutil.which('tmux'):
+            raise ValueError('squad up needs tmux installed')
+        if subprocess.run(['tmux', 'has-session', '-t', '=' + session_name],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            os.execvp('tmux', ['tmux', 'attach', '-t', '=' + session_name])
+    members = sessions(path)
+    if args.select_role:
+        matches = [s for s in members if s['role'] == args.select_role]
+        if not matches:
+            matches = [s for s in members if s['role'] == 'default']
+        if len(matches) != 1:
+            raise ValueError(f'role {args.select_role!r} needs one matching session or one default session')
+        print(matches[0]['name'])
+        return
+    for member in members:
+        if not member['directory'].is_dir():
+            raise ValueError(f"{member['name']}: no such directory: {member['directory']}")
+        if not (args.dry_run or args.sync_skills) and not shutil.which(member['command'][0]):
+            raise ValueError(f"{member['name']}: executable not found: {member['command'][0]}")
+    links = skill_links(board, members)
+    if args.dry_run:
+        for member in members:
+            print(f"cd {shlex.quote(str(member['directory']))} && {launch_command(member, board, yolo=not args.no_yolo)}")
+        for target, source in links.items():
+            print(f'# skill: {target} -> {source}')
+        return
+    sync_skills(links)
+    if args.sync_skills:
+        print(f'linked {len(links)} skills across {len(members)} sessions')
+        return
+    run(str(ROOT / 'bin/squad'), 'init', env={**os.environ, 'SQUAD_DIR': str(board)},
+        stdout=subprocess.DEVNULL)
+    for index, member in enumerate(members):
+        if index == 0:
+            pane = run('tmux', 'new-session', '-d', '-P', '-F', '#{pane_id}',
+                       '-s', session_name, '-c', str(member['directory']),
+                       capture_output=True).stdout.strip()
+        else:
+            pane = run('tmux', 'split-window', '-h', '-P', '-F', '#{pane_id}',
+                       '-t', '=' + session_name, '-c', str(member['directory']),
+                       capture_output=True).stdout.strip()
+        run('tmux', 'send-keys', '-t', pane, '-l', launch_command(member, board, yolo=not args.no_yolo))
+        run('tmux', 'send-keys', '-t', pane, 'Enter')
+        run('tmux', 'select-layout', '-t', '=' + session_name, 'even-horizontal',
+            stdout=subprocess.DEVNULL)
+    os.execvp('tmux', ['tmux', 'attach', '-t', '=' + session_name])
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f'squad-up: {error}', file=sys.stderr)
+        sys.exit(1)
