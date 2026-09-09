@@ -121,6 +121,26 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.request('POST','/api/action',[])[0],400)
         self.assertEqual(self.request()[1]['tasks'],[])
 
+    def test_runtime_status_is_separate_from_task_status(self):
+        import datetime
+        self.cli('add', 'Still needs review')
+        folder = self.path / 'runtime/builder'
+        folder.mkdir(parents=True)
+        record = dict(name='builder', started='2026-01-01T00:00:00+00:00',
+                      heartbeat='2026-01-01T00:00:00+00:00', state='running')
+        path = folder / 'run.json'
+        path.write_text(json.dumps(record))
+        state = self.request()[1]
+        self.assertEqual(state['agents'][0]['runtime']['state'], 'unknown')
+        record['heartbeat'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        path.write_text(json.dumps(record))
+        self.assertEqual(self.request()[1]['agents'][0]['runtime']['state'], 'running')
+        record.update(state='exited', exit_code=0)
+        path.write_text(json.dumps(record))
+        state = self.request()[1]
+        self.assertEqual(state['agents'][0]['runtime']['state'], 'exited')
+        self.assertEqual(state['tasks'][0]['status'], 'backlog')
+
     def test_assets_and_empty_board(self):
         for path in ('/','/app.js','/style.css'):
             self.assertEqual(self.request(path=path)[0],200)

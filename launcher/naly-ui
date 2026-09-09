@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Serve the live Naly Stack board on loopback using only Python's standard library."""
 import argparse
+import datetime
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.machinery
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socketserver
 import subprocess
 import threading
 
@@ -77,7 +79,28 @@ class Board:
             for name in (task.get('owner'), task.get('assigned'), task.get('reviewer')):
                 if name:
                     agents.setdefault(name, dict(name=name, role='', provider='', model='', configured=False))
+        runs = {}
+        runtime = self.path / 'runtime'
+        if runtime.is_dir():
+            for path in runtime.glob('*/*.json'):
+                try:
+                    record = json.loads(path.read_text())
+                    name = record['name']
+                    heartbeat = datetime.datetime.fromisoformat(record['heartbeat'])
+                    if record.get('state') in ('starting', 'running'):
+                        age = (datetime.datetime.now(datetime.timezone.utc) - heartbeat).total_seconds()
+                        if age > 10:
+                            record['state'] = 'unknown'
+                    runs.setdefault(name, []).append(record)
+                    agents.setdefault(name, dict(name=name, role=record.get('role', ''),
+                        provider=record.get('provider', ''), model=record.get('model') or 'CLI default', configured=False))
+                except (OSError, ValueError, KeyError, TypeError):
+                    warnings.append('A session status record could not be read.')
         for agent in agents.values():
+            history = sorted(runs.get(agent['name'], []), key=lambda r: r.get('started', ''), reverse=True)
+            agent['runs'] = history[:10]
+            active = [r for r in history if r.get('state') in ('running', 'starting')]
+            agent['runtime'] = active[0] if active else history[0] if history else {'state': 'untracked'}
             agent['tasks'] = [t['id'] for t in tasks if t.get('status') != 'done' and
                 agent['name'] in (t.get('owner'), t.get('assigned'), t.get('reviewer'))]
             agent['last_event'] = next((e['time'] for e in reversed(events) if e['actor'] == agent['name']), '')
@@ -198,8 +221,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send(400, {'error': str(exc)})
 
 
+class LocalServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # Loopback has a known name; avoid a blocking reverse-DNS lookup at startup.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = 'localhost'
+        self.server_port = self.server_address[1]
+
+
 def make_server(board, port):
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    server = LocalServer(('127.0.0.1', port), Handler)
     server.board = board
     return server
 

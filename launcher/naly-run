@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Record a launched session's lifecycle without intercepting its terminal I/O."""
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+
+def stamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def save(path, record):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(record) + '\n')
+    temporary.replace(path)
+
+
+def main():
+    command = sys.argv[1:]
+    if command[:1] == ['--']:
+        command = command[1:]
+    name = os.environ.get('SQUAD_NAME', '')
+    board = os.environ.get('SQUAD_DIR', '')
+    if not command or not board or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', name):
+        sys.exit('naly-run requires SQUAD_DIR, a valid SQUAD_NAME, and -- <command>')
+    run_id = uuid.uuid4().hex
+    folder = Path(board) / 'runtime' / name
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (run_id + '.json')
+    record = dict(run_id=run_id, name=name, started=stamp(), heartbeat=stamp(),
+                  state='starting', monitor_pid=os.getpid(), provider=os.environ.get('SQUAD_AGENT_KIND', ''),
+                  model=os.environ.get('SQUAD_MODEL', ''), role=os.environ.get('SQUAD_ROLE', ''))
+    save(path, record)
+    try:
+        child = subprocess.Popen(command)
+    except OSError as exc:
+        record.update(state='failed', ended=stamp(), exit_code=127, error=str(exc))
+        save(path, record)
+        print(f'naly-run: {exc}', file=sys.stderr)
+        return 127
+    # Terminal Ctrl-C reaches both processes in their shared foreground group. The
+    # wrapper stays alive to observe the CLI; it must not deliver Ctrl-C twice.
+    signal.signal(signal.SIGINT, lambda *_: None)
+    def forward(number, _frame):
+        if child.poll() is None:
+            child.send_signal(number)
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, forward)
+    record.update(state='running', pid=child.pid)
+    write_warning = False
+    while True:
+        code = child.poll()
+        record['heartbeat'] = stamp()
+        if code is not None:
+            record.update(state='exited' if code == 0 else 'failed', exit_code=code, ended=stamp())
+        try:
+            save(path, record)
+        except OSError as exc:
+            if not write_warning:
+                print(f'naly-run: status recording unavailable: {exc}', file=sys.stderr)
+                write_warning = True
+        if code is not None:
+            return code if code >= 0 else 128 - code
+        time.sleep(1)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

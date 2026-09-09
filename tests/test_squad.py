@@ -139,7 +139,8 @@ class SquadTests(unittest.TestCase):
         for words, flag in zip(commands, ('--dangerously-skip-permissions',
                                           '--dangerously-bypass-approvals-and-sandbox')):
             self.assertIn(flag, words)
-            self.assertLess(words.index(flag), words.index('--'))
+            worker = words[words.index(str(ROOT / 'launcher/naly-run')) + 2:]
+            self.assertLess(worker.index(flag), worker.index('--'))
             self.assertIn('SQUAD_YOLO=1', words)
         result = self.cli('up', '--dry-run', '--no-yolo')
         self.assertNotIn('--dangerously-', result.stdout)

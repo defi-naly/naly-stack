@@ -2,7 +2,7 @@
 const $ = selector => document.querySelector(selector);
 const el = (tag, text, cls) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (cls) node.className = cls; return node; };
 let state, selected, pending = false;
-const statuses = [['backlog', 'Queued'], ['doing', 'In progress'], ['review', 'Review'], ['blocked', 'Blocked / handed off'], ['done', 'Done']];
+const statuses = [['backlog', 'Queued'], ['doing', 'In progress'], ['review', 'Review'], ['blocked', 'Blocked'], ['done', 'Done']];
 const date = value => value ? new Date(value).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : 'No recorded activity';
 function renderBoard() {
   const query = $('#search').value.toLowerCase();
@@ -19,10 +19,14 @@ function renderBoard() {
       card.append(el('span', task.id, 'task-id'), el('h3', task.title || 'Untitled task'));
       card.append(el('div', task.status === 'review' ? `${task.owner || 'Unassigned'} → ${task.reviewer || 'Reviewer'}` : task.owner || task.assigned || 'Unassigned', 'task-meta'));
       if (task.role) card.append(el('span', task.role, 'tag'));
+      const owner = state.agents.find(a=>a.name === task.owner);
+      const workerState = owner && owner.runtime && owner.runtime.state;
+      if (task.status === 'doing' && ['exited','failed','unknown'].includes(workerState))
+        card.append(el('div',workerState === 'unknown' ? 'Session status lost' : 'Session ended · check task','task-warning'));
       card.addEventListener('click', () => openTask(task));
       column.append(card);
     }
-    if (!matching.length) column.append(el('p', query ? 'No matching tasks' : status === 'backlog' ? 'Room for the next idea.' : 'Nothing here yet.', 'empty'));
+    if (!matching.length) column.append(el('p', query ? 'No matching tasks' : 'No tasks', 'empty'));
     $('#board').append(column);
   }
 }
@@ -34,8 +38,13 @@ function render() {
   for (const agent of state.agents) {
     const card = el('article', undefined, 'agent');
     const content = el('div'); content.append(el('h3', agent.name), el('p', [agent.provider,agent.model,agent.role].filter(Boolean).join(' · ') || 'Board participant'));
-    card.append(el('span', agent.name.slice(0,2).toUpperCase(), 'avatar'), content,
-      el('p', `${agent.tasks.length ? agent.tasks.join(', ') : 'No open tasks'} · ${date(agent.last_event)}`, 'agent-work'));
+    const runtime = agent.runtime || {state:'untracked'};
+    const labels = {starting:'Starting',running:'Running',exited:'Exited · code 0',failed:`Failed · ${runtime.exit_code < 0 ? 'signal ' + -runtime.exit_code : 'code ' + runtime.exit_code}`,unknown:'Status lost',untracked:'Not tracked'};
+    const status = el('span',labels[runtime.state] || 'Unknown','runtime ' + runtime.state);
+    status.title = runtime.state === 'running' ? 'Session process is alive. It may be working or waiting for input.' : runtime.state === 'unknown' ? 'No monitor heartbeat for more than 10 seconds. The worker may still be running.' : runtime.state === 'untracked' ? 'Launch with naly up to record session status.' : 'Process exit does not mean the task was accepted.';
+    card.append(content,status,el('p',agent.tasks.length ? agent.tasks.join(', ') : 'No open tasks','agent-work'));
+    if (runtime.started) card.append(el('p',`${runtime.ended ? 'Ended ' + date(runtime.ended) : 'Started ' + date(runtime.started)}`,'agent-time'));
+    if ((agent.runs || []).filter(r=>r.state === 'running').length > 1) card.append(el('p','Multiple sessions running with this name','agent-work'));
     $('#agents').append(card);
   }
   if (!state.agents.length) $('#agents').append(el('p', 'Add agents to your sessions file or register a session with naly name.', 'empty'));
@@ -52,7 +61,7 @@ async function refresh() {
   try {
     const response = await fetch('/api/state', {cache:'no-store'});
     const data = await response.json(); if (!response.ok) throw Error(data.error);
-    const changed = JSON.stringify(state) !== JSON.stringify(data);
+    const changed = JSON.stringify(state, (key,value)=>key === 'heartbeat' ? undefined : value) !== JSON.stringify(data, (key,value)=>key === 'heartbeat' ? undefined : value);
     state = data; if (changed) render();
     $('#connection').textContent = 'Live · just updated'; $('#connection').className = 'live';
     if (data.warnings.length) notify(data.warnings.join(' '));

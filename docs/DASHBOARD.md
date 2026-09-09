@@ -39,6 +39,32 @@ cooperative and are not a transaction across all fields. Avoid changing the same
 task simultaneously from its agent session and dashboard. Temporary intermediate
 states may be visible while a CLI command updates multiple fields.
 
+## Session tracking
+
+New sessions launched by `naly up` (including its generated terminal commands) run
+through Naly Stack's own lifecycle recorder. It leaves terminal input and output
+connected directly to the agent. Each launch gets a unique record under
+`.squad/runtime/<session>/<run-id>.json` with process IDs, start time, a monitor
+heartbeat, and the real exit code when available. Records are replaced atomically.
+No agent logs or prompts are copied into these records.
+
+| Status | Meaning |
+|---|---|
+| Running | The monitor recently observed the agent process alive. It may be working or waiting for input. |
+| Exited · code 0 | The session exited successfully. Task acceptance remains a separate review decision. |
+| Failed | The session returned a nonzero exit code or was terminated by a signal. |
+| Status lost | No monitor heartbeat for over 10 seconds. The agent might still be alive; inspect its terminal before restarting. |
+| Not tracked | No lifecycle record exists for this agent. Existing sessions are not retroactively wrapped. |
+
+The dashboard can close and reconnect without losing the recorded result. A fresh
+monitor heartbeat is evidence of process life, not productive progress or a test
+result. A hung agent can still show Running. If the monitor or host is killed before
+it records an exit, the UI shows Status lost instead of guessing success. Older run
+records are retained; multiple live runs with the same name are flagged.
+
+To track an existing team, relaunch its agents when their work is safely stopped.
+Attaching to an already-running tmux session does not add tracking to those processes.
+
 ## Remote access
 
 Run `naly ui` on the host alongside the board and agents. From your laptop:

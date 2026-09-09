@@ -106,7 +106,7 @@ def launch_command(member, board, yolo=True):
         command.append(bypass_flags[agent])
     if agent in bypass_flags:
         command += ['--add-dir', str(board), '--']
-    return shlex.join(env + command + [prompt])
+    return shlex.join(env + [str(ROOT / 'launcher/naly-run'), '--'] + command + [prompt])
 
 
 def main():

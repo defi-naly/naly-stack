@@ -75,12 +75,14 @@ two seconds, including changes agents make through the CLI. No npm install, data
 or hosted account is needed; the server uses Python's standard library.
 
 - **Follow work:** queued, in progress, review, blocked, and completed tasks.
-- **See your team:** configured providers, models, roles, open tasks, and recorded activity.
+- **See your team:** providers, models, open tasks, and recorded session status.
 - **Direct tasks:** create work, route it by role, or hand off queued and blocked tasks.
 - **Review results:** inspect branch and handoff notes, pass a review, or return it with feedback.
 
 The dashboard records actions as `dashboard` through the existing CLI and event feed.
-It does not stream conversations, wake idle agents, or report process health. Learning
+New launches record process status and exit codes separately from task completion.
+A running process may be waiting for input. The UI does not stream conversations or
+wake idle agents. Learning
 proposals remain available through `naly insights` and `naly proposal` in the terminal.
 For remote access and operating details, see [Dashboard setup](docs/DASHBOARD.md).
 

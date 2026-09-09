@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${BIN:-$HOME/.local/bin}"
 mkdir -p "$BIN"
 
-chmod +x "$ROOT/bin/squad" "$ROOT/launcher/squad-up" "$ROOT/launcher/squad-learn" "$ROOT/launcher/naly-ui"
+chmod +x "$ROOT/bin/squad" "$ROOT/launcher/squad-up" "$ROOT/launcher/squad-learn" "$ROOT/launcher/naly-ui" "$ROOT/launcher/naly-run"
 ln -sf "$ROOT/bin/naly" "$BIN/naly"
 ln -sf "$ROOT/bin/squad"          "$BIN/squad"
 ln -sf "$ROOT/launcher/squad-up"  "$BIN/squad-up"

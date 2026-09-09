@@ -2,14 +2,14 @@
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Naly Stack · Live board</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
 <body>
-<header><a class="brand" href="/" aria-label="Naly Stack home"><span class="mark">n.</span> NALY STACK</a><span class="local">LOCAL WORKSPACE</span><span id="connection" role="status">Connecting…</span></header>
+<header><a class="brand" href="/" aria-label="Naly Stack home">Naly Stack</a><span id="connection" role="status">Connecting…</span></header>
 <main>
-<section class="intro"><div><p class="eyebrow">YOUR AGENTS. ONE WORKSPACE.</p><h1 id="project">Team board</h1><p class="subtitle">Give work direction. Keep the whole team in view.</p></div><button id="new-task" class="primary">＋ New task</button></section>
+<section class="intro"><div><h1 id="project">Team board</h1></div><button id="new-task" class="primary">＋ New task</button></section>
 <div id="notice" role="status" hidden></div>
-<section aria-label="Team overview"><div class="section-heading"><h2>The team <span id="agent-count"></span></h2><span>Configured agents · activity from board events</span></div><div id="agents"></div></section>
-<section class="work"><div class="section-heading"><h2>Work in motion <span id="task-count"></span></h2><label class="search-label">Search tasks<input id="search" type="search" placeholder="Search tasks, owners, skills…"></label></div><div id="board" aria-label="Task board"></div></section>
-<section class="activity"><div class="section-heading"><h2>Latest activity</h2><span>Refreshes every 2 seconds</span></div><div id="events"></div></section>
-<footer>One shared board. Every change stays in sync with your terminal. <span>Agent sessions run independently of this window.</span></footer>
+<section aria-label="Team overview"><div class="section-heading"><h2>Agents <span id="agent-count"></span></h2><span>Session status is separate from task completion</span></div><div id="agents"></div></section>
+<section class="work"><div class="section-heading"><h2>Tasks <span id="task-count"></span></h2><label class="search-label">Search tasks<input id="search" type="search" placeholder="Search tasks, owners, skills…"></label></div><div id="board" aria-label="Task board"></div></section>
+<details class="activity"><summary>Recent activity</summary><div id="events"></div></details>
+<footer>Updates every 2 seconds. Closing this page leaves your agents running.</footer>
 </main>
 <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>Create a task</h2><button type="button" data-close aria-label="Close">×</button></div><label>What needs doing?<input name="title" required maxlength="300" placeholder="Build the account settings page"></label><label>Route by role<select name="role" id="role-options"><option value="">Anyone can claim</option></select></label><label>Shared skills<input name="skills" placeholder="frontend-design, testing"></label><label>Context and acceptance criteria<input name="notes" maxlength="4000" placeholder="What should a good result look like?"></label><p class="hint">Creates a board task. Idle agents need a prompt to check their inbox.</p><p class="form-error" role="alert"></p><button class="primary" type="submit">Add to board</button></form></dialog>
 <dialog id="task-dialog"><div class="dialog-heading"><span id="detail-id" class="eyebrow"></span><button type="button" data-close aria-label="Close">×</button></div><h2 id="detail-title"></h2><div id="detail-fields"></div><form id="task-form"><div id="task-controls"></div><p class="form-error" role="alert"></p><div id="task-actions"></div></form></dialog>
