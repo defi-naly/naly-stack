@@ -244,6 +244,11 @@ skills)
   shift
   exec env SQUAD_DIR="$DIR" squad-up --sync-skills "$@" ;;
 
+ui)
+  have_dir
+  command -v naly-ui >/dev/null || die "dashboard naly-ui not on PATH; rerun install.sh."
+  exec env SQUAD_DIR="$DIR" naly-ui "$@" ;;
+
 up)
   command -v squad-up >/dev/null || die "launcher 'squad-up' not on PATH (install.sh symlinks it; or run launcher/squad-up directly)."
   exec env SQUAD_DIR="$DIR" squad-up "$@" ;;
@@ -320,6 +325,7 @@ setup
   naly skills sync [file]      link shared skills into each session worktree
 
 work loop
+  naly ui [--port 4310]        open a live local dashboard (prints its URL)
   naly board                   the rendered board (roster · tasks · recent)
   naly inbox                   what's happened FOR YOU since you last looked
   naly add "<title>" [--role frontend] [--skills name,name] [--notes "..."]

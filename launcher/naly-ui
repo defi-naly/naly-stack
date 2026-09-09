@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Serve the live Naly Stack board on loopback using only Python's standard library."""
+import argparse
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import subprocess
+import threading
+
+ROOT = Path(__file__).resolve().parents[1]
+loader = importlib.machinery.SourceFileLoader('naly_launcher', str(ROOT / 'launcher/squad-up'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+launcher = importlib.util.module_from_spec(spec)
+loader.exec_module(launcher)
+
+
+def read_fields(path):
+    fields = {}
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition('=')
+        if sep:
+            fields.setdefault(key, value)
+    return fields
+
+
+def task_data(path):
+    raw = path.read_bytes()
+    fields = {}
+    for line in raw.decode().splitlines():
+        key, sep, value = line.partition('=')
+        if sep:
+            fields.setdefault(key, value)
+    fields['id'] = path.name
+    fields['version'] = hashlib.sha256(raw).hexdigest()
+    return fields
+
+
+class Board:
+    def __init__(self, path):
+        self.path = path.resolve()
+        self.token = secrets.token_urlsafe(32)
+        self.lock = threading.Lock()
+        self.env = {**os.environ, 'SQUAD_DIR': str(self.path), 'SQUAD_NAME': 'dashboard',
+                    'PATH': f'{ROOT / "bin"}:{ROOT / "launcher"}:' + os.environ.get('PATH', '')}
+
+    def snapshot(self):
+        tasks = [task_data(p) for p in self.path.joinpath('tasks').iterdir()
+                 if re.fullmatch(r't[0-9]+', p.name) and p.is_file()]
+        tasks.sort(key=lambda t: int(t['id'][1:]))
+        agents = {}
+        warnings = []
+        sessions = Path(os.environ.get('SQUAD_SESSIONS', str(self.path / 'sessions'))).expanduser()
+        if sessions.exists():
+            try:
+                for member in launcher.sessions(sessions):
+                    agents[member['name']] = dict(name=member['name'], role=member['role'],
+                        provider=Path(member['command'][0]).name, model=member['model'] or 'CLI default', configured=True)
+            except (ValueError, OSError) as exc:
+                warnings.append(f'Cannot read sessions: {exc}')
+        for p in self.path.joinpath('roster').iterdir():
+            if p.is_file() and not p.name.endswith('.seen'):
+                name = p.read_text().strip()
+                agents.setdefault(name, dict(name=name, role='', provider='', model='', configured=False))
+        events = []
+        if (self.path / 'events.log').exists():
+            for line in (self.path / 'events.log').read_text().splitlines():
+                parts = line.split('\t', 5)
+                if len(parts) == 6:
+                    events.append(dict(zip(('time', 'actor', 'verb', 'task', 'target', 'message'), parts)))
+        for task in tasks:
+            for name in (task.get('owner'), task.get('assigned'), task.get('reviewer')):
+                if name:
+                    agents.setdefault(name, dict(name=name, role='', provider='', model='', configured=False))
+        for agent in agents.values():
+            agent['tasks'] = [t['id'] for t in tasks if t.get('status') != 'done' and
+                agent['name'] in (t.get('owner'), t.get('assigned'), t.get('reviewer'))]
+            agent['last_event'] = next((e['time'] for e in reversed(events) if e['actor'] == agent['name']), '')
+        return dict(project=read_fields(self.path / 'config').get('project', self.path.parent.name),
+                    tasks=tasks, agents=list(agents.values()), events=events[-40:][::-1],
+                    warnings=warnings, token=self.token)
+
+    def command(self, args):
+        result = subprocess.run([str(ROOT / 'bin/naly'), *args], env=self.env,
+                                capture_output=True, text=True, timeout=20)
+        if result.returncode:
+            raise ValueError(result.stderr.strip() or result.stdout.strip() or 'Board action failed')
+        return dict(message=result.stdout.strip(), warning=result.stderr.strip())
+
+    def mutate(self, data):
+        def value(key, required=False, limit=4000):
+            v = data.get(key, '')
+            if not isinstance(v, str) or len(v) > limit or any(ord(c) < 32 for c in v):
+                raise ValueError(f'Invalid {key}: use a single line of text (max {limit} characters)')
+            v = v.strip()
+            if required and not v:
+                raise ValueError(f'{key} is required')
+            return v
+        action = value('action', True)
+        with self.lock:
+            if action == 'create':
+                args = ['add', value('title', True, 300), '--notes', value('notes'), '--skills', value('skills')]
+                role = value('role', limit=100)
+                if role:
+                    args += ['--role', role]
+                return self.command(args)
+            task_id = value('id', True)
+            if not re.fullmatch(r't[0-9]+', task_id):
+                raise ValueError('Invalid task ID')
+            path = self.path / 'tasks' / task_id
+            if not path.is_file():
+                raise ValueError('Task no longer exists')
+            task = task_data(path)
+            if value('version', True) != task['version']:
+                raise ValueError('Task changed since you opened it. Close and reopen it before acting.')
+            if action in ('pass', 'fail'):
+                if task.get('status') != 'review':
+                    raise ValueError('Only tasks awaiting review can receive a verdict')
+                args = [action, task_id]
+                if action == 'fail':
+                    args.append(value('reason', True))
+                return self.command(args)
+            if action == 'handoff':
+                if task.get('status') not in ('backlog', 'blocked'):
+                    raise ValueError('Only queued or blocked tasks can be handed off here; active agents must hand off their own work')
+                if (self.path / 'locks' / task_id).exists():
+                    raise ValueError('Task is claimed; ask its owner to hand it off')
+                target = value('target', True, 100)
+                if target not in [a['name'] for a in self.snapshot()['agents']]:
+                    raise ValueError('Choose a known agent')
+                return self.command(['handoff', task_id, '--to', target, '--notes', value('notes')])
+            raise ValueError('Unknown action')
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def send(self, status, payload, kind='application/json'):
+        body = json.dumps(payload).encode() if kind == 'application/json' else payload
+        self.send_response(status)
+        self.send_header('Content-Type', kind)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def allowed_host(self):
+        return self.headers.get('Host') in {f'localhost:{self.server.server_port}', f'127.0.0.1:{self.server.server_port}'}
+
+    def do_GET(self):
+        if not self.allowed_host():
+            self.send(403, {'error': 'Use the localhost URL printed by naly ui'})
+            return
+        try:
+            if self.path == '/api/state':
+                with self.server.board.lock:
+                    self.send(200, self.server.board.snapshot())
+                return
+            files = {'/': ('index.html', 'text/html; charset=utf-8'),
+                     '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
+                     '/style.css': ('style.css', 'text/css; charset=utf-8')}
+            if self.path not in files:
+                self.send(404, {'error': 'Not found'})
+                return
+            name, kind = files[self.path]
+            self.send(200, (ROOT / 'dashboard' / name).read_bytes(), kind)
+        except (OSError, ValueError) as exc:
+            self.send(503, {'error': f'Cannot read board: {exc}'})
+
+    def do_POST(self):
+        origin = 'http://' + self.headers.get('Host', '')
+        if (not self.allowed_host() or self.headers.get('Origin') != origin or
+                not secrets.compare_digest(self.headers.get('X-Naly-Token', ''), self.server.board.token)):
+            self.send(403, {'error': 'Reload the dashboard before making changes'})
+            return
+        if self.path != '/api/action':
+            self.send(404, {'error': 'Not found'})
+            return
+        try:
+            if self.headers.get('Content-Type') != 'application/json':
+                raise ValueError('Expected application/json')
+            size = int(self.headers.get('Content-Length', '0'))
+            if not 0 < size <= 16384:
+                raise ValueError('Invalid request size')
+            data = json.loads(self.rfile.read(size))
+            if not isinstance(data, dict):
+                raise ValueError('Expected a JSON object')
+            self.send(200, self.server.board.mutate(data))
+        except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            self.send(400, {'error': str(exc)})
+
+
+def make_server(board, port):
+    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    server.board = board
+    return server
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--port', type=int, default=4310)
+    args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error('port must be between 0 and 65535')
+    board = Board(launcher.board_dir())
+    if not (board.path / 'tasks').is_dir():
+        parser.error('No board here. Run naly init first.')
+    try:
+        server = make_server(board, args.port)
+    except OSError as exc:
+        parser.exit(1, f'Cannot start dashboard: {exc}. Try --port with another port.\n')
+    print(f'Naly Stack · http://127.0.0.1:{server.server_port}\nBoard: {board.path}\nCtrl-C to stop the dashboard; agent sessions keep running.', flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == '__main__':
+    main()

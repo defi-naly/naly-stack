@@ -2,7 +2,7 @@
 
 Naly Stack coordinates agents that can access the same board directory. You can run them
 in normal terminal tabs, in tmux on your own computer, or in tmux on a remote host.
-SSH is needed only for the last option. There is no Naly Stack web server to expose.
+SSH is needed only for the last option. The optional dashboard binds to loopback; [use an SSH tunnel](DASHBOARD.md#remote-access) to reach it remotely.
 
 ## Use terminal tabs without tmux
 
@@ -120,8 +120,8 @@ Open `http://localhost:4000` on the laptop. The tunnel doesn't start the app; it
 server must already be running on the remote host at that address and port. SSH
 `connect failed: Connection refused` messages when using the tunnel indicate that
 the remote forwarding destination is refusing the connection. Check the app's
-listening address and port on the host. No forwarding is needed for the Naly Stack board
-or tmux itself.
+listening address and port on the host. No forwarding is needed for the terminal board or tmux itself. The optional browser
+dashboard uses its own tunnel, described in [Dashboard setup](DASHBOARD.md#remote-access).
 
 ## Check in from your phone
 

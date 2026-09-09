@@ -10,11 +10,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${BIN:-$HOME/.local/bin}"
 mkdir -p "$BIN"
 
-chmod +x "$ROOT/bin/squad" "$ROOT/launcher/squad-up" "$ROOT/launcher/squad-learn"
+chmod +x "$ROOT/bin/squad" "$ROOT/launcher/squad-up" "$ROOT/launcher/squad-learn" "$ROOT/launcher/naly-ui"
 ln -sf "$ROOT/bin/naly" "$BIN/naly"
 ln -sf "$ROOT/bin/squad"          "$BIN/squad"
 ln -sf "$ROOT/launcher/squad-up"  "$BIN/squad-up"
 ln -sf "$ROOT/launcher/squad-learn" "$BIN/squad-learn"
+ln -sf "$ROOT/launcher/naly-ui" "$BIN/naly-ui"
 echo "linked:  $BIN/naly  →  $ROOT/bin/naly"
 echo "linked:  $BIN/squad  →  $ROOT/bin/squad"
 echo "linked:  $BIN/squad-up  →  $ROOT/launcher/squad-up"
@@ -34,6 +35,7 @@ Naly Stack installed. Quickstart:
   naly name you
   naly add "first task"
   naly board
+  naly ui                 # live dashboard at http://127.0.0.1:4310
 
 For a mixed Claude/Codex squad:
   cp templates/sessions.example your-project/.squad/sessions

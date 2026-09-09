@@ -6,7 +6,7 @@
 
 **Let Claude build the interface. Let Codex build the engine. Give them a shared board, shared skills, and a way to hand work to each other.**
 
-[Choose your setup](#choose-your-setup) · [Get started](#get-started) · [How it works](#how-it-works) · [Shared skills](#one-skill-library-every-agent) · [Learning](#turn-repeated-feedback-into-shared-lessons) · [Commands](#command-reference)
+[Choose your setup](#choose-your-setup) · [Get started](#get-started) · [Live dashboard](#live-dashboard) · [How it works](#how-it-works) · [Shared skills](#one-skill-library-every-agent) · [Learning](#turn-repeated-feedback-into-shared-lessons) · [Commands](#command-reference)
 
 MIT · Local-first · Any model · Shared lessons
 
@@ -60,7 +60,29 @@ claims, and handoffs. You can inspect the board or jump into any agent's termina
 | **Review before finishing** | Use the review workflow to return changes with feedback or mark them passed after checking. |
 | **Keep agents moving** | Claude and Codex launch in YOLO mode by default, without tool approval prompts. |
 | **Learn from corrections** | Record outcomes and check results, surface recurring feedback, and review proposed changes to shared skills. |
-| **See the state** | Tasks are plain files. The board is rendered from them. No hosted service or separate dashboard to maintain. |
+| **Manage a live board** | Open `naly ui` to see tasks, configured agents, and activity. Create tasks, route by role, hand off queued work, and review results. |
+
+## Live dashboard
+
+From your initialized project, run:
+
+```bash
+naly ui
+```
+
+Open **http://127.0.0.1:4310**. The dashboard refreshes from the same task files every
+two seconds, including changes agents make through the CLI. No npm install, database,
+or hosted account is needed; the server uses Python's standard library.
+
+- **Follow work:** queued, in progress, review, blocked, and completed tasks.
+- **See your team:** configured providers, models, roles, open tasks, and recorded activity.
+- **Direct tasks:** create work, route it by role, or hand off queued and blocked tasks.
+- **Review results:** inspect branch and handoff notes, pass a review, or return it with feedback.
+
+The dashboard records actions as `dashboard` through the existing CLI and event feed.
+It does not stream conversations, wake idle agents, or report process health. Learning
+proposals remain available through `naly insights` and `naly proposal` in the terminal.
+For remote access and operating details, see [Dashboard setup](docs/DASHBOARD.md).
 
 ## Start with the team you need
 
